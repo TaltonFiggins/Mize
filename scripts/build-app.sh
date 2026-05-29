@@ -9,6 +9,7 @@ CONFIG="${CONFIG:-debug}"
 APP_DIR="build/${APP_NAME}.app"
 CONTENTS="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS}/MacOS"
+RESOURCES_DIR="${CONTENTS}/Resources"
 
 echo "→ swift build -c ${CONFIG}"
 swift build -c "${CONFIG}"
@@ -21,8 +22,12 @@ fi
 
 echo "→ assembling ${APP_DIR}"
 rm -rf "${APP_DIR}"
-mkdir -p "${MACOS_DIR}"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${BIN_PATH}" "${MACOS_DIR}/${APP_NAME}"
+
+if [ -f "Resources/AppIcon.icns" ]; then
+    cp "Resources/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
+fi
 
 cat > "${CONTENTS}/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -45,6 +50,8 @@ cat > "${CONTENTS}/Info.plist" <<EOF
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSPrincipalClass</key>
