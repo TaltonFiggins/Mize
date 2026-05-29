@@ -1,0 +1,14 @@
+.DS_Store
+
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+
+# App bundle (produced by scripts/build-app.sh)
+build/
+Cue.app/
+
+# Local scene config (per-user, not source of truth)
+*.cuescenes.local.json
