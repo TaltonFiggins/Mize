@@ -29,6 +29,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Input
     private var keyMonitorLocal: Any?
     private var keyMonitorGlobal: Any?
+    private var mouseMoveMonitorLocal: Any?
+    private var mouseMoveMonitorGlobal: Any?
+    private var cursorHideTimer: Timer?
+    /// CGDisplayHideCursor / ShowCursor stack per-process — every hide
+    /// needs a matching show. Gate behind this so back-to-back idles
+    /// don't leave the show count negative.
+    private var isCursorHidden = false
+    /// Idle delay before the cursor hides itself. 2s is short enough to feel
+    /// snappy during a talk but long enough that small adjustments don't
+    /// flicker the cursor.
+    private let cursorIdleDelay: TimeInterval = 2.0
 
     // State
     private let windowManager = WindowManager()
@@ -44,6 +55,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // consistent with where the chrome bars actually are.
     private var topGap: CGFloat = 0
     private var botGap: CGFloat = 0
+
+    /// AX-coord canvas: the area between the top + bottom chrome covers.
+    /// All pane frames are clamped to this so windows never render under
+    /// the bars.
+    private var canvas: CGRect {
+        guard let screen = NSScreen.main else { return .zero }
+        return CGRect(
+            x: 0,
+            y: topGap,
+            width: screen.frame.width,
+            height: screen.frame.height - topGap - botGap
+        )
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else {
@@ -63,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         installMizeWindows(on: screen)
         installKeyMonitors()
+        installCursorAutoHide()
 
         // Suppress system chrome whenever Mize is active. (Chrome covers above
         // handle the case when a target app is active and chrome wants to bleed
@@ -147,21 +172,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.currentScene < self.scenes.count else { return }
             var texts = self.scenes[self.currentScene].texts
             guard index < texts.count else { return }
-            let old = texts[index]
-            texts[index] = CurtainText(
-                content: old.content,
-                position: newPosition,
-                font: old.font,
-                color: old.color,
-                alignment: old.alignment
-            )
-            let scene = self.scenes[self.currentScene]
-            self.scenes[self.currentScene] = Scene(
-                title: scene.title,
-                panes: scene.panes,
-                backgroundColor: scene.backgroundColor,
-                texts: texts
-            )
+            texts[index] = texts[index].moved(to: newPosition)
+            self.scenes[self.currentScene] = self.scenes[self.currentScene].with(texts: texts)
             self.sceneStore.save(self.scenes)
         }
     }
@@ -218,18 +230,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keyMonitorGlobal = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
             handler(event)
         }
-        keyMonitorLocal = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // If a text input has focus (editor title / text box / window
-            // picker search), don't intercept — let the user type/navigate.
+        keyMonitorLocal = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let fr = NSApp.keyWindow?.firstResponder
             let isEditingText = (fr is NSTextView) || (fr is NSText)
-            if isEditingText {
-                return event
-            }
-            handler(event)
             let cmd = event.modifierFlags.contains(.command)
             let shift = event.modifierFlags.contains(.shift)
             let char = event.charactersIgnoringModifiers
+            // If a text input has focus, only intercept the editor toggle
+            // (Cmd+E) — everything else (typing, Cmd+arrow text nav, Cmd+S)
+            // belongs to the text field.
+            if isEditingText {
+                if cmd, char == "e" {
+                    self?.toggleEditor()
+                    return nil
+                }
+                return event
+            }
+            handler(event)
             if cmd && (char == "," || char == "e" || char == "o") { return nil }
             if cmd && shift && char?.lowercased() == "s" { return nil }
             switch event.keyCode {
@@ -242,6 +259,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openConfigInEditor() {
         NSWorkspace.shared.open(sceneStore.url)
+    }
+
+    // MARK: - Cursor auto-hide
+
+    /// Wire up global + local mouse-moved (and dragged) monitors so the
+    /// cursor hides itself after `cursorIdleDelay` seconds of stillness.
+    /// Both monitors are needed: global fires for events going to other
+    /// apps (e.g., the foregrounded target app); local fires for events
+    /// hitting Mize's own windows (curtain in edit mode, editor panel).
+    private func installCursorAutoHide() {
+        let mask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged,
+        ]
+        mouseMoveMonitorGlobal = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            self?.noteCursorMovement()
+        }
+        mouseMoveMonitorLocal = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.noteCursorMovement()
+            return event
+        }
+        // Schedule the initial hide so a fresh launch with no mouse motion
+        // still hides the cursor.
+        noteCursorMovement()
+    }
+
+    private func noteCursorMovement() {
+        // Real mouse motion → unhide immediately.
+        if isCursorHidden {
+            CGDisplayShowCursor(CGMainDisplayID())
+            isCursorHidden = false
+        }
+        cursorHideTimer?.invalidate()
+        cursorHideTimer = Timer.scheduledTimer(withTimeInterval: cursorIdleDelay, repeats: false) { [weak self] _ in
+            // Timer fires on the main run loop, so we're already on the
+            // main thread — assumeIsolated lets us call the MainActor
+            // method synchronously without a Task hop.
+            MainActor.assumeIsolated {
+                self?.hideCursorIfStill()
+            }
+        }
+    }
+
+    private func hideCursorIfStill() {
+        // Don't hide while the editor panel is up — the user needs the
+        // cursor visible to pick fields, open the color well, etc.
+        if editorPanel?.isVisible == true { return }
+        if isCursorHidden { return }
+        // CGDisplayHideCursor works regardless of whether Mize is the
+        // foreground app — NSCursor.setHiddenUntilMouseMoves silently
+        // no-ops while a target app (Brave, etc.) holds focus, which is
+        // exactly the case we care about during a presentation.
+        CGDisplayHideCursor(CGMainDisplayID())
+        isCursorHidden = true
+    }
+
+    private func showCursorIfHidden() {
+        if isCursorHidden {
+            CGDisplayShowCursor(CGMainDisplayID())
+            isCursorHidden = false
+        }
     }
 
     // MARK: - Scene-set file management
@@ -318,6 +398,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             refreshEditor()
             panel.center()
+            // Cmd+E almost always fires while a target app is foreground —
+            // it's caught by the GLOBAL key monitor, not the local one.
+            // Without activating Mize first, makeKeyAndOrderFront leaves the
+            // panel behind the target app and looks like nothing happened.
+            NSApp.activate(ignoringOtherApps: true)
             panel.makeKeyAndOrderFront(nil)
             setEditMode(true)
         }
@@ -347,7 +432,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = EditorPanel()
         panel.delegate = self  // for windowWillClose → exit edit mode
         if let screen = NSScreen.main {
-            let canvas = CGRect(x: 0, y: topGap, width: screen.frame.width, height: screen.frame.height - topGap - botGap)
             panel.configure(canvas: canvas, screenFrame: screen.frame)
         }
         panel.onSceneEdited = { [weak self] updated, panesChanged in
@@ -361,13 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // did since the last scene transition by capturing current
                 // window frames into the scene before applying styling.
                 self.captureCurrentSceneFrames()
-                let capturedPanes = self.scenes[self.currentScene].panes
-                let merged = Scene(
-                    title: updated.title,
-                    panes: capturedPanes,
-                    backgroundColor: updated.backgroundColor,
-                    texts: updated.texts
-                )
+                let merged = updated.with(panes: self.scenes[self.currentScene].panes)
                 self.scenes[self.currentScene] = merged
                 self.applyStyling(merged)  // no re-activation — windows stay put
             }
@@ -612,7 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // future lookups are stable across title changes.
         var updated: [Pane] = []
         for pane in scene.panes {
-            guard let match = findWindow(matching: pane),
+            guard let match = pane.resolve(in: windowManager.snapshot),
                   let pos = WindowManager.currentPosition(of: match.axElement),
                   let size = WindowManager.currentSize(of: match.axElement)
             else {
@@ -624,12 +702,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let frameChanged = actual != pane.frame
             let idAdded = (pane.cgWindowID == nil && resolvedID != nil)
             if frameChanged || idAdded {
-                updated.append(Pane(
-                    appNameContains: pane.appNameContains,
-                    titleContains: pane.titleContains,
-                    frame: actual,
-                    cgWindowID: resolvedID
-                ))
+                updated.append(pane.with(frame: actual, cgWindowID: resolvedID))
             } else {
                 updated.append(pane)
             }
@@ -638,55 +711,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Z-order capture. CGWindowListCopyWindowInfo returns windows
         // front-to-back. We want panes[last] to be most frontmost (since
         // activateScene activates apps in pane order, last = on top).
-        let windowList = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []
+        let windowList = Self.currentZOrder()
         let reordered = updated.sorted { lhs, rhs in
-            zOrderIndex(of: lhs, in: windowList) > zOrderIndex(of: rhs, in: windowList)
+            lhs.zOrderIndex(in: windowList) > rhs.zOrderIndex(in: windowList)
         }
 
         let framesChanged = zip(scene.panes, updated).contains { $0.0.frame != $0.1.frame }
-        let orderChanged = !panesEqual(scene.panes, reordered)
+        let orderChanged = !Pane.layoutsEqual(scene.panes, reordered)
         if framesChanged || orderChanged {
-            scenes[currentScene] = Scene(
-                title: scene.title,
-                panes: reordered,
-                backgroundColor: scene.backgroundColor,
-                texts: scene.texts
-            )
+            scenes[currentScene] = scene.with(panes: reordered)
             sceneStore.save(scenes)
         }
     }
 
-    private func zOrderIndex(of pane: Pane, in windowList: [[String: Any]]) -> Int {
-        // Prefer matching by CGWindowID when we have one (immune to title
-        // changes from channel switching, etc.).
-        if let id = pane.cgWindowID, id != 0 {
-            for (idx, win) in windowList.enumerated() {
-                if let n = win[kCGWindowNumber as String] as? Int, CGWindowID(n) == id {
-                    return idx
-                }
-            }
+    /// Snapshot the on-screen window list, front-to-back, as plain values
+    /// the pure z-order matching can consume.
+    private static func currentZOrder() -> [ZOrderEntry] {
+        let raw = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []
+        return raw.map { win in
+            ZOrderEntry(
+                windowNumber: (win[kCGWindowNumber as String] as? Int).map(CGWindowID.init),
+                ownerName: win[kCGWindowOwnerName as String] as? String,
+                title: win[kCGWindowName as String] as? String
+            )
         }
-        // Fallback: app name + optional title substring.
-        for (idx, win) in windowList.enumerated() {
-            guard let ownerName = win[kCGWindowOwnerName as String] as? String else { continue }
-            guard ownerName.lowercased().contains(pane.appNameContains.lowercased()) else { continue }
-            if let titleContains = pane.titleContains, !titleContains.isEmpty {
-                let winTitle = (win[kCGWindowName as String] as? String) ?? ""
-                guard winTitle.lowercased().contains(titleContains.lowercased()) else { continue }
-            }
-            return idx
-        }
-        return Int.max
-    }
-
-    private func panesEqual(_ a: [Pane], _ b: [Pane]) -> Bool {
-        guard a.count == b.count else { return false }
-        for (l, r) in zip(a, b) {
-            if l.appNameContains != r.appNameContains
-                || l.titleContains != r.titleContains
-                || l.frame != r.frame { return false }
-        }
-        return true
     }
 
     private func activateScene(at index: Int) {
@@ -696,19 +744,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyStyling(scene)
         refreshEditor()
 
-        // Position every target window BEFORE hiding — that way when we unhide
-        // the target apps below, their windows snap back into the scene layout.
+        // Resolve panes → snapshot windows. We don't touch the windows yet;
+        // the actual minimize/setFrame/raise has to happen AFTER the
+        // hide-then-unhide cycle below, otherwise the hide pass can reset
+        // minimization state on some apps and a sibling window slips back
+        // into view.
         var targetPIDs: Set<pid_t> = []
         var targetMatches: [(WindowManager.WindowState, Pane)] = []
+        var targetAXElements: [AXUIElement] = []
         for pane in scene.panes {
-            guard let match = findWindow(matching: pane) else {
+            guard let match = pane.resolve(in: windowManager.snapshot) else {
                 NSLog("Mize:   pane '%@' — no matching window", pane.appNameContains)
                 continue
             }
-            windowManager.setFrame(match.axElement, to: pane.frame, label: pane.appNameContains)
-            windowManager.raise(match.axElement, label: pane.appNameContains)
             targetPIDs.insert(match.pid)
             targetMatches.append((match, pane))
+            targetAXElements.append(match.axElement)
+            NSLog("Mize:   target: app=%@ title=%@ cgWindowID=%d pane.titleContains=%@",
+                  match.appName ?? "?",
+                  match.title ?? "?",
+                  Int(match.cgWindowID),
+                  pane.titleContains ?? "<nil>")
         }
 
         // Use NSApp's "Hide Others" (Cmd+Opt+H equivalent) instead of per-app
@@ -717,22 +773,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.hideOtherApplications(self)
 
-        // Unhide every target app first (without activating), then activate
-        // only the LAST pane's app. Multiple activates in quick succession
-        // get partially denied by macOS's focus-stealing protections, which
-        // causes alternating z-order between visits. With one activate,
-        // the last pane is reliably frontmost; the others appear behind it
-        // in macOS's default order.
-        for (match, pane) in targetMatches {
+        // Unhide each target app so its windows reappear before we manipulate them.
+        for (match, _) in targetMatches {
             NSRunningApplication(processIdentifier: match.pid)?.unhide()
-            windowManager.setFrame(match.axElement, to: pane.frame, label: "re:\(pane.appNameContains)")
         }
+
+        // Hide every NON-target window of each target app so only the
+        // pane-targeted window is visible when the app comes forward.
+        //
+        // Use a LIVE enumeration of the target apps' windows, not the
+        // startup snapshot — otherwise windows the user opened after
+        // launching Mize (new browser windows, new Ghostty terminals)
+        // won't be hidden because they aren't in the snapshot.
+        //
+        // Match by AXUIElement identity (CFEqual) AND by CGWindowID,
+        // since fresh AX queries can hand back new wrappers and we want
+        // to recognize the same underlying window either way.
+        //
+        // Belt + suspenders: AX setMinimized AND move off-screen. Some
+        // apps (Ghostty) silently refuse setMinimized via AX, so the move
+        // is what actually hides them. -32000 is well outside any plausible
+        // display bounds without overflowing signed-int coord ranges some
+        // apps clamp to. captureExtraIfNew lets restoreSnapshot put the
+        // new (post-snapshot) windows back to where the user had them.
+        var targetCGWindowIDs: Set<CGWindowID> = []
+        for (state, _) in targetMatches where state.cgWindowID != 0 {
+            targetCGWindowIDs.insert(state.cgWindowID)
+        }
+        let offscreen = CGPoint(x: -32_000, y: -32_000)
+        let liveWins = windowManager.liveWindows(for: targetPIDs)
+        NSLog("Mize:   liveWindows count=%d for targetPIDs=%@",
+              liveWins.count,
+              targetPIDs.map(String.init).joined(separator: ","))
+        for w in liveWins {
+            let isTargetByAX = targetAXElements.contains { CFEqual($0, w.axElement) }
+            let isTargetByID = w.cgWindowID != 0 && targetCGWindowIDs.contains(w.cgWindowID)
+            if isTargetByAX || isTargetByID {
+                NSLog("Mize:     KEEP pid=%d cgWindowID=%d (byAX=%@ byID=%@)",
+                      Int(w.pid), Int(w.cgWindowID),
+                      isTargetByAX ? "Y" : "N",
+                      isTargetByID ? "Y" : "N")
+                continue
+            }
+            windowManager.captureExtraIfNew(w.axElement)
+            let minErr = windowManager.setMinimized(w.axElement, true, label: "non-target")
+            let mvErr = windowManager.move(w.axElement, to: offscreen, label: "non-target")
+            // Read back position to detect silent clamping by the app.
+            let actual = WindowManager.currentPosition(of: w.axElement) ?? .zero
+            NSLog("Mize:     HIDE pid=%d cgWindowID=%d minErr=%d mvErr=%d actualPos=(%.0f,%.0f)",
+                  Int(w.pid), Int(w.cgWindowID),
+                  minErr.rawValue, mvErr.rawValue,
+                  actual.x, actual.y)
+        }
+
+        // Position + raise each target window. setMinimized(false) first in
+        // case a previous scene minimized this window as a non-target.
+        for (match, pane) in targetMatches {
+            windowManager.setMinimized(match.axElement, false, label: pane.appNameContains)
+            let frame = CanvasGeometry.clamp(pane.frame, to: canvas)
+            windowManager.setFrame(match.axElement, to: frame, label: pane.appNameContains)
+            windowManager.raise(match.axElement, label: pane.appNameContains)
+        }
+
+        // Activate only the LAST pane's app. Multiple activates in quick
+        // succession get partially denied by macOS's focus-stealing
+        // protections; one activate reliably wins. Important: NO
+        // .activateAllWindows — that unminimizes siblings and undoes the
+        // per-window isolation above.
         if let last = targetMatches.last,
            let app = NSRunningApplication(processIdentifier: last.0.pid) {
             if #available(macOS 14.0, *) {
-                _ = app.activate(from: NSRunningApplication.current, options: [.activateAllWindows])
+                _ = app.activate(from: NSRunningApplication.current, options: [])
             } else {
-                _ = app.activate(options: [.activateAllWindows])
+                _ = app.activate(options: [])
             }
         }
     }
@@ -747,34 +860,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         botCurtainView?.backgroundColor = scene.backgroundColor
     }
 
-    /// Resolve a pane to a WindowState via three tiers:
-    /// 1. Session-scoped CGWindowID (exact, immune to title changes)
-    /// 2. App name + title substring (across-session, if title hasn't drifted)
-    /// 3. App name only (last-resort fallback)
-    private func findWindow(matching pane: Pane) -> WindowManager.WindowState? {
-        if let id = pane.cgWindowID, id != 0,
-           let match = windowManager.snapshot.first(where: { $0.cgWindowID == id })
-        {
-            return match
-        }
-        let appNeedle = pane.appNameContains.lowercased()
-        if let titleSubstring = pane.titleContains?.lowercased(), !titleSubstring.isEmpty {
-            let strict = windowManager.snapshot.first { state in
-                guard let app = state.appName?.lowercased(), app.contains(appNeedle) else { return false }
-                guard let title = state.title?.lowercased() else { return false }
-                return title.contains(titleSubstring)
-            }
-            if let strict { return strict }
-        }
-        return windowManager.snapshot.first { state in
-            guard let app = state.appName?.lowercased() else { return false }
-            return app.contains(appNeedle)
-        }
-    }
-
     // MARK: - Shutdown
 
     private func shutdown() {
+        // Restore the cursor first — otherwise an ESC while the cursor is
+        // hidden leaves it invisible until something else touches CGDisplay.
+        showCursorIfHidden()
+
         let appsToUnhide = originalVisibleApps
         originalVisibleApps.removeAll()
         for pid in appsToUnhide {
@@ -795,6 +887,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         if let m = keyMonitorLocal { NSEvent.removeMonitor(m); keyMonitorLocal = nil }
         if let m = keyMonitorGlobal { NSEvent.removeMonitor(m); keyMonitorGlobal = nil }
+        if let m = mouseMoveMonitorLocal { NSEvent.removeMonitor(m); mouseMoveMonitorLocal = nil }
+        if let m = mouseMoveMonitorGlobal { NSEvent.removeMonitor(m); mouseMoveMonitorGlobal = nil }
+        cursorHideTimer?.invalidate()
+        cursorHideTimer = nil
+        // Belt-and-suspenders in case shutdown() wasn't the exit path.
+        showCursorIfHidden()
         sceneStore.stopWatching()
     }
 }

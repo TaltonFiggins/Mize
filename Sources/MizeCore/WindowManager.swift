@@ -19,7 +19,7 @@ private func _AXUIElementGetWindow(
 final class WindowManager {
 
     /// State of a single window captured at snapshot time. Restored on exit.
-    struct WindowState {
+    struct WindowState: WindowIdentity {
         let cgWindowID: CGWindowID
         let axElement: AXUIElement
         let pid: pid_t
@@ -32,6 +32,12 @@ final class WindowManager {
     }
 
     private(set) var snapshot: [WindowState] = []
+
+    /// Original frames for windows the user opened AFTER snapshot time.
+    /// We record them the first time we move/hide them so restoreSnapshot()
+    /// can return them to their pre-Mize position on exit. Keyed by
+    /// AXUIElement (compared with CFEqual; `===` doesn't work on CF types).
+    private var extraOriginals: [(axElement: AXUIElement, position: CGPoint, size: CGSize)] = []
 
     // MARK: - Snapshot
 
@@ -106,7 +112,51 @@ final class WindowManager {
                 resize(state.axElement, to: state.originalSize, label: state.title ?? "?")
             }
         }
-        NSLog("Mize: restored %d windows", snapshot.count)
+        // Also restore windows opened AFTER the startup snapshot. We captured
+        // their original position the first time we moved them off-screen;
+        // without this they'd be left at (-32000, -32000) on exit.
+        for extra in extraOriginals {
+            // Unminimize first if we minimized it.
+            if Self.isMinimized(extra.axElement) {
+                setMinimized(extra.axElement, false, label: "(extra)")
+            }
+            let curPos = Self.getPosition(of: extra.axElement) ?? .zero
+            let curSize = Self.getSize(of: extra.axElement) ?? .zero
+            if curPos != extra.position {
+                move(extra.axElement, to: extra.position, label: "(extra)")
+            }
+            if curSize != extra.size {
+                resize(extra.axElement, to: extra.size, label: "(extra)")
+            }
+        }
+        NSLog("Mize: restored %d windows (+%d extras)", snapshot.count, extraOriginals.count)
+    }
+
+    /// Live AX enumeration of every window currently owned by the given PIDs.
+    /// Unlike `snapshot`, this catches windows opened after Mize startup —
+    /// essential for hiding non-pane windows in `activateScene`.
+    func liveWindows(for pids: Set<pid_t>) -> [(pid: pid_t, axElement: AXUIElement, cgWindowID: CGWindowID)] {
+        var result: [(pid_t, AXUIElement, CGWindowID)] = []
+        for pid in pids {
+            let app = AXUIElementCreateApplication(pid)
+            guard let windows = Self.getWindows(of: app) else { continue }
+            for w in windows {
+                let id = Self.getCGWindowID(of: w) ?? 0
+                result.append((pid, w, id))
+            }
+        }
+        return result
+    }
+
+    /// Record an AX element's current frame so `restoreSnapshot()` can put it
+    /// back later, IF it isn't already covered by the startup snapshot.
+    /// Idempotent — repeated calls with the same element are no-ops.
+    func captureExtraIfNew(_ axElement: AXUIElement) {
+        if snapshot.contains(where: { CFEqual($0.axElement, axElement) }) { return }
+        if extraOriginals.contains(where: { CFEqual($0.axElement, axElement) }) { return }
+        guard let pos = Self.getPosition(of: axElement),
+              let size = Self.getSize(of: axElement) else { return }
+        extraOriginals.append((axElement, pos, size))
     }
 
     // MARK: - Operations

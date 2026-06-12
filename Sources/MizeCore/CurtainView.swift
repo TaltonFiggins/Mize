@@ -78,14 +78,7 @@ final class CurtainView: NSView {
         guard isInteractive, let idx = draggingIndex, idx < texts.count else { return }
         let local = convert(event.locationInWindow, from: nil)
         let newPos = CGPoint(x: local.x - dragOffset.x, y: local.y - dragOffset.y)
-        let old = texts[idx]
-        texts[idx] = CurtainText(
-            content: old.content,
-            position: newPos,
-            font: old.font,
-            color: old.color,
-            alignment: old.alignment
-        )
+        texts[idx] = texts[idx].moved(to: newPos)
     }
 
     override func mouseUp(with event: NSEvent) {

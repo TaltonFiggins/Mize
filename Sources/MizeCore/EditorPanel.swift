@@ -68,7 +68,34 @@ final class EditorPanel: NSPanel {
 
     // Per-row controls keyed by the window's app+title fingerprint so we
     // can re-find them on refresh.
-    private var rowControls: [(checkbox: NSButton, popup: NSPopUpButton, fingerprint: String)] = []
+    @MainActor
+    private struct WindowRowControls {
+        let checkbox: NSButton
+        let popup: NSPopUpButton
+        let xField: NSTextField
+        let yField: NSTextField
+        let wField: NSTextField
+        let hField: NSTextField
+        let frameRow: NSStackView
+        let fingerprint: String
+
+        var fieldPct: CanvasGeometry.Pct {
+            CanvasGeometry.Pct(
+                x: CGFloat(xField.doubleValue),
+                y: CGFloat(yField.doubleValue),
+                w: CGFloat(wField.doubleValue),
+                h: CGFloat(hField.doubleValue)
+            )
+        }
+
+        func setFrameFields(to pct: CanvasGeometry.Pct) {
+            xField.stringValue = CanvasGeometry.formatPct(pct.x)
+            yField.stringValue = CanvasGeometry.formatPct(pct.y)
+            wField.stringValue = CanvasGeometry.formatPct(pct.w)
+            hField.stringValue = CanvasGeometry.formatPct(pct.h)
+        }
+    }
+    private var rowControls: [WindowRowControls] = []
 
     init() {
         super.init(
@@ -298,30 +325,29 @@ final class EditorPanel: NSPanel {
 
     // MARK: - Window list
 
-    private static let layoutOptions: [(label: String, frame: (CGRect) -> CGRect)] = [
-        ("Full",        { $0 }),
-        ("Left Half",   { CGRect(x: $0.minX, y: $0.minY, width: $0.width / 2, height: $0.height) }),
-        ("Right Half",  { CGRect(x: $0.midX, y: $0.minY, width: $0.width / 2, height: $0.height) }),
-        ("Top Half",    { CGRect(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height / 2) }),
-        ("Bottom Half", { CGRect(x: $0.minX, y: $0.midY, width: $0.width, height: $0.height / 2) }),
-    ]
+    private static let customLabel = "Custom"
+    private var customLayoutIndex: Int { LayoutPreset.allCases.count }  // last popup entry
+
+    /// Popup index for a pane frame: its matching preset, else "Custom".
+    private func popupIndex(for frame: CGRect) -> Int {
+        guard let preset = LayoutPreset.matching(frame, in: canvas),
+              let idx = LayoutPreset.allCases.firstIndex(of: preset)
+        else { return customLayoutIndex }
+        return idx
+    }
 
     private func rebuildWindowList() {
         for v in windowsStack.arrangedSubviews { v.removeFromSuperview() }
         rowControls.removeAll()
 
-        // Same filter as the rest of the app's candidate picking
-        let skipPrefixes = [
-            "com.apple.dock", "com.apple.controlcenter", "com.apple.notificationcenterui",
-            "com.apple.WindowManager", "com.apple.systemuiserver", "com.apple.finder",
-            "com.apple.wallpaper", "com.apple.screencaptureui",
-            Bundle.main.bundleIdentifier ?? "",
-        ]
         let candidates = availableWindows.filter { w in
-            guard let bid = w.bundleID, !skipPrefixes.contains(where: { bid.lowercased().hasPrefix($0.lowercased()) }) else { return false }
-            guard !w.wasMinimized else { return false }
-            guard let t = w.title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return false }
-            return w.originalSize.width >= 200 && w.originalSize.height >= 200
+            EditorCandidates.isCandidate(
+                bundleID: w.bundleID,
+                title: w.title,
+                isMinimized: w.wasMinimized,
+                size: w.originalSize,
+                ownBundleID: Bundle.main.bundleIdentifier
+            )
         }
 
         guard !candidates.isEmpty else {
@@ -333,20 +359,8 @@ final class EditorPanel: NSPanel {
         }
 
         for w in candidates {
-            let fingerprint = "\(w.appName ?? "?")|\(w.title ?? "")"
-
-            // Prefer CGWindowID match; fall back to app-only loose match for
-            // panes whose stored title may not match the current window title
-            // (e.g., Slack channel switches, browser tab changes).
-            let currentPane = currentScene?.panes.first { pane in
-                if let id = pane.cgWindowID, id == w.cgWindowID { return true }
-                guard let app = w.appName?.lowercased() else { return false }
-                guard app.contains(pane.appNameContains.lowercased()) else { return false }
-                if let tc = pane.titleContains, !tc.isEmpty {
-                    return (w.title?.lowercased().contains(tc.lowercased())) ?? false
-                }
-                return true
-            }
+            let fingerprint = w.fingerprint
+            let currentPane = currentScene?.panes.first { $0.corresponds(to: w) }
 
             let cb = NSButton(checkboxWithTitle: "", target: self, action: #selector(windowToggled(_:)))
             cb.state = currentPane != nil ? .on : .off
@@ -362,55 +376,121 @@ final class EditorPanel: NSPanel {
             label.font = .systemFont(ofSize: 11)
 
             let popup = NSPopUpButton()
-            for option in Self.layoutOptions { popup.addItem(withTitle: option.label) }
+            for preset in LayoutPreset.allCases { popup.addItem(withTitle: preset.label) }
+            popup.addItem(withTitle: Self.customLabel)
             popup.action = #selector(windowLayoutChanged(_:))
             popup.target = self
             popup.identifier = NSUserInterfaceItemIdentifier(fingerprint)
             popup.isEnabled = (cb.state == .on)
-            // Try to match current pane's frame to a preset
-            if let pane = currentPane {
-                popup.selectItem(at: Self.matchLayoutIndex(pane.frame, canvas: canvas))
-            }
 
-            let row = NSStackView(views: [cb, label, popup])
-            row.orientation = .horizontal
-            row.spacing = 6
-            row.alignment = .centerY
-            row.distribution = .fill
+            // Frame % fields. Shown only when checkbox is on so unchecked rows
+            // stay compact.
+            let xField = makeFrameField(axis: "x", fingerprint: fingerprint)
+            let yField = makeFrameField(axis: "y", fingerprint: fingerprint)
+            let wField = makeFrameField(axis: "w", fingerprint: fingerprint)
+            let hField = makeFrameField(axis: "h", fingerprint: fingerprint)
+            let frameRow = NSStackView(views: [
+                axisLabel("X"), xField,
+                axisLabel("Y"), yField,
+                axisLabel("W"), wField,
+                axisLabel("H"), hField,
+                axisLabel("%"),
+            ])
+            frameRow.orientation = .horizontal
+            frameRow.spacing = 3
+            frameRow.alignment = .centerY
+
+            let row = WindowRowControls(
+                checkbox: cb,
+                popup: popup,
+                xField: xField,
+                yField: yField,
+                wField: wField,
+                hField: hField,
+                frameRow: frameRow,
+                fingerprint: fingerprint
+            )
+
+            // Initialize field values + popup selection from the current pane.
+            if let pane = currentPane {
+                row.setFrameFields(to: CanvasGeometry.pct(of: pane.frame, in: canvas))
+                popup.selectItem(at: popupIndex(for: pane.frame))
+            } else {
+                row.setFrameFields(to: CanvasGeometry.Pct(x: 0, y: 0, w: 100, h: 100))
+                popup.selectItem(at: 0)
+            }
+            frameRow.isHidden = (cb.state != .on)
+
+            let topRow = NSStackView(views: [cb, label, popup])
+            topRow.orientation = .horizontal
+            topRow.spacing = 6
+            topRow.alignment = .centerY
+            topRow.distribution = .fill
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             popup.setContentHuggingPriority(.required, for: .horizontal)
 
-            windowsStack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalToConstant: 310).isActive = true
+            let container = NSStackView(views: [topRow, frameRow])
+            container.orientation = .vertical
+            container.spacing = 2
+            container.alignment = .leading
 
-            rowControls.append((checkbox: cb, popup: popup, fingerprint: fingerprint))
+            windowsStack.addArrangedSubview(container)
+            container.widthAnchor.constraint(equalToConstant: 310).isActive = true
+
+            rowControls.append(row)
         }
     }
 
-    private static func matchLayoutIndex(_ frame: CGRect, canvas: CGRect) -> Int {
-        let tolerance: CGFloat = 8
-        for (i, option) in layoutOptions.enumerated() {
-            let expected = option.frame(canvas)
-            if abs(expected.minX - frame.minX) < tolerance
-                && abs(expected.minY - frame.minY) < tolerance
-                && abs(expected.width - frame.width) < tolerance
-                && abs(expected.height - frame.height) < tolerance
-            {
-                return i
-            }
-        }
-        return 0  // default to Full
+    private func makeFrameField(axis: String, fingerprint: String) -> NSTextField {
+        let f = NSTextField()
+        f.alignment = .right
+        f.font = .systemFont(ofSize: 11)
+        f.placeholderString = "0"
+        f.target = self
+        f.action = #selector(frameFieldChanged(_:))
+        f.identifier = NSUserInterfaceItemIdentifier("frame:\(fingerprint):\(axis)")
+        f.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        return f
+    }
+
+    private func axisLabel(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.font = .systemFont(ofSize: 10)
+        l.textColor = .tertiaryLabelColor
+        return l
     }
 
     @objc private func windowToggled(_ sender: NSButton) {
-        // Enable/disable matching popup
         for row in rowControls where row.checkbox === sender {
             row.popup.isEnabled = (sender.state == .on)
+            row.frameRow.isHidden = (sender.state != .on)
         }
         emitPanes()
     }
 
     @objc private func windowLayoutChanged(_ sender: NSPopUpButton) {
+        // If the user picked a preset (not "Custom"), update the visible %
+        // fields to match the preset so the inputs reflect reality.
+        let idx = sender.indexOfSelectedItem
+        if idx < LayoutPreset.allCases.count,
+           let row = rowControls.first(where: { $0.popup === sender }) {
+            let frame = LayoutPreset.allCases[idx].frame(in: canvas)
+            row.setFrameFields(to: CanvasGeometry.pct(of: frame, in: canvas))
+        }
+        emitPanes()
+    }
+
+    @objc private func frameFieldChanged(_ sender: NSTextField) {
+        // Editing any field forces the popup to "Custom" so subsequent reads
+        // don't snap back to the preset.
+        let id = sender.identifier?.rawValue ?? ""
+        let parts = id.split(separator: ":")
+        if parts.count >= 2 {
+            let fp = String(parts[1])
+            if let row = rowControls.first(where: { $0.fingerprint == fp }) {
+                row.popup.selectItem(at: customLayoutIndex)
+            }
+        }
         emitPanes()
     }
 
@@ -423,24 +503,20 @@ final class EditorPanel: NSPanel {
         var panes = scene.panes
 
         for row in rowControls {
-            guard let w = availableWindows.first(where: {
-                "\($0.appName ?? "?")|\($0.title ?? "")" == row.fingerprint
-            }) else { continue }
+            guard let w = availableWindows.first(where: { $0.fingerprint == row.fingerprint })
+            else { continue }
 
-            // Does this window correspond to an existing pane?
-            let existingIdx = panes.firstIndex { pane in
-                if let id = pane.cgWindowID, id == w.cgWindowID { return true }
-                guard let app = w.appName?.lowercased() else { return false }
-                guard app.contains(pane.appNameContains.lowercased()) else { return false }
-                if let tc = pane.titleContains, !tc.isEmpty {
-                    return (w.title?.lowercased().contains(tc.lowercased())) ?? false
-                }
-                return true
-            }
+            let existingIdx = panes.firstIndex { $0.corresponds(to: w) }
 
             if row.checkbox.state == .on {
                 let layoutIdx = row.popup.indexOfSelectedItem
-                let frame = Self.layoutOptions[layoutIdx].frame(canvas)
+                let frame: CGRect
+                if layoutIdx < LayoutPreset.allCases.count {
+                    frame = LayoutPreset.allCases[layoutIdx].frame(in: canvas)
+                } else {
+                    // "Custom" — read the % fields directly.
+                    frame = CanvasGeometry.frame(from: row.fieldPct, in: canvas)
+                }
                 let newPane = Pane(
                     appNameContains: w.appName ?? "",
                     titleContains: w.title,
@@ -457,12 +533,7 @@ final class EditorPanel: NSPanel {
             }
         }
 
-        let updated = Scene(
-            title: scene.title,
-            panes: panes,
-            backgroundColor: scene.backgroundColor,
-            texts: scene.texts
-        )
+        let updated = scene.with(panes: panes)
         currentScene = updated
         onSceneEdited?(updated, true)
     }
@@ -553,9 +624,8 @@ final class EditorPanel: NSPanel {
         } else {
             texts = []
         }
-        let updated = Scene(
+        let updated = scene.with(
             title: titleField.stringValue.isEmpty ? scene.title : titleField.stringValue,
-            panes: scene.panes,
             backgroundColor: colorWell.color,
             texts: texts
         )
@@ -576,9 +646,8 @@ final class EditorPanel: NSPanel {
             let anchor = TextAnchor(rawValue: anchorRaw) ?? .center
             texts = [CurtainText.at(content, screen: screen, anchor: anchor, fontSize: textSize)]
         }
-        let updated = Scene(
+        let updated = scene.with(
             title: titleField.stringValue.isEmpty ? scene.title : titleField.stringValue,
-            panes: scene.panes,
             backgroundColor: colorWell.color,
             texts: texts
         )

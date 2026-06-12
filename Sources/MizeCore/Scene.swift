@@ -17,6 +17,16 @@ struct Pane {
         self.frame = frame
         self.cgWindowID = cgWindowID
     }
+
+    /// Copy with an updated frame and (possibly upgraded) window ID.
+    func with(frame: CGRect, cgWindowID: CGWindowID?) -> Pane {
+        Pane(
+            appNameContains: appNameContains,
+            titleContains: titleContains,
+            frame: frame,
+            cgWindowID: cgWindowID
+        )
+    }
 }
 
 /// A piece of text rendered on the curtain.
@@ -31,6 +41,17 @@ struct CurtainText {
     let alignment: Alignment
 
     enum Alignment { case topLeft, center }
+
+    /// Copy at a new position (everything else preserved). Used by text drag.
+    func moved(to position: CGPoint) -> CurtainText {
+        CurtainText(
+            content: content,
+            position: position,
+            font: font,
+            color: color,
+            alignment: alignment
+        )
+    }
 
     static func title(_ content: String, screen: NSScreen, color: NSColor = .white) -> CurtainText {
         CurtainText(
@@ -104,5 +125,20 @@ struct Scene {
         self.panes = panes
         self.backgroundColor = backgroundColor
         self.texts = texts
+    }
+
+    /// Copy with selected fields replaced; nil keeps the current value.
+    func with(
+        title: String? = nil,
+        panes: [Pane]? = nil,
+        backgroundColor: NSColor? = nil,
+        texts: [CurtainText]? = nil
+    ) -> Scene {
+        Scene(
+            title: title ?? self.title,
+            panes: panes ?? self.panes,
+            backgroundColor: backgroundColor ?? self.backgroundColor,
+            texts: texts ?? self.texts
+        )
     }
 }
